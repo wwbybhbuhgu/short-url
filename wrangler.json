@@ -10,6 +10,12 @@
 			"database_name": "d1-template-database"
 		}
 	],
+	"kv_namespaces": [
+		{
+			"binding": "KV-1",
+			"id": "a2ad8db305fa4e22addffd762f1d4d71"
+		}
+	],
 	"observability": {
 		"enabled": true
 	}
