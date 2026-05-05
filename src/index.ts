@@ -1,7 +1,7 @@
-// ==================== 类型定义 ==================== 
+// ==================== 类型定义 ====================
 export interface Env {
     DB: D1Database;
-    KV: KVNamespace;
+    'KV-1': KVNamespace;   // 绑定名称必须与 Dashboard 中的变量名一致：KV-1
 }
 
 interface LinkRecord {
@@ -32,12 +32,11 @@ function escapeHtml(str: string): string {
 }
 
 async function updateKVCache(env: Env, slug: string, url: string): Promise<void> {
-    await env.KV.put(slug, url, { expirationTtl: 86400 });
+    await env['KV-1'].put(slug, url, { expirationTtl: 86400 });
 }
 
-// ==================== 前端页面 HTML（无 emoji，简洁风格） ====================
+// ==================== 前端页面 HTML（简洁风格，无 emoji） ====================
 function renderIndexPage(env: Env, requestUrl: URL): string {
-    const baseUrl = `${requestUrl.protocol}//${requestUrl.host}`;
     return `<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
@@ -45,20 +44,13 @@ function renderIndexPage(env: Env, requestUrl: URL): string {
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>短链接服务</title>
     <style>
-        * {
-            margin: 0;
-            padding: 0;
-            box-sizing: border-box;
-        }
+        * { margin: 0; padding: 0; box-sizing: border-box; }
         body {
             font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', sans-serif;
             background: #f3f4f6;
             padding: 40px 20px;
         }
-        .container {
-            max-width: 1200px;
-            margin: 0 auto;
-        }
+        .container { max-width: 1200px; margin: 0 auto; }
         .card {
             background: #ffffff;
             border-radius: 12px;
@@ -71,22 +63,10 @@ function renderIndexPage(env: Env, requestUrl: URL): string {
             border-bottom: 1px solid #e5e7eb;
             background: #fafafa;
         }
-        .card-header h1 {
-            font-size: 24px;
-            font-weight: 600;
-            color: #111827;
-        }
-        .card-header p {
-            font-size: 14px;
-            color: #6b7280;
-            margin-top: 6px;
-        }
-        .card-body {
-            padding: 28px;
-        }
-        .form-group {
-            margin-bottom: 20px;
-        }
+        .card-header h1 { font-size: 24px; font-weight: 600; color: #111827; }
+        .card-header p { font-size: 14px; color: #6b7280; margin-top: 6px; }
+        .card-body { padding: 28px; }
+        .form-group { margin-bottom: 20px; }
         label {
             display: block;
             font-size: 14px;
@@ -108,17 +88,9 @@ function renderIndexPage(env: Env, requestUrl: URL): string {
             border-color: #3b82f6;
             box-shadow: 0 0 0 3px rgba(59,130,246,0.1);
         }
-        textarea {
-            resize: vertical;
-            min-height: 90px;
-        }
-        .row {
-            display: flex;
-            gap: 20px;
-        }
-        .row .form-group {
-            flex: 1;
-        }
+        textarea { resize: vertical; min-height: 90px; }
+        .row { display: flex; gap: 20px; }
+        .row .form-group { flex: 1; }
         button {
             background: #3b82f6;
             color: white;
@@ -131,9 +103,7 @@ function renderIndexPage(env: Env, requestUrl: URL): string {
             transition: background 0.15s;
             width: 100%;
         }
-        button:hover {
-            background: #2563eb;
-        }
+        button:hover { background: #2563eb; }
         .result {
             margin-top: 24px;
             padding: 16px;
@@ -141,36 +111,22 @@ function renderIndexPage(env: Env, requestUrl: URL): string {
             border-radius: 8px;
             display: none;
         }
-        .result.show {
-            display: block;
-        }
+        .result.show { display: block; }
         .short-url {
             display: flex;
             align-items: center;
             gap: 10px;
             margin-top: 12px;
         }
-        .short-url input {
-            flex: 1;
-            background: white;
-            font-family: monospace;
-        }
+        .short-url input { flex: 1; background: white; font-family: monospace; }
         .copy-btn {
             background: #6b7280;
             width: auto;
             padding: 8px 16px;
         }
-        .copy-btn:hover {
-            background: #4b5563;
-        }
-        .error {
-            color: #dc2626;
-            font-size: 14px;
-            margin-top: 10px;
-        }
-        .table-container {
-            overflow-x: auto;
-        }
+        .copy-btn:hover { background: #4b5563; }
+        .error { color: #dc2626; font-size: 14px; margin-top: 10px; }
+        .table-container { overflow-x: auto; }
         table {
             width: 100%;
             border-collapse: collapse;
@@ -181,11 +137,7 @@ function renderIndexPage(env: Env, requestUrl: URL): string {
             text-align: left;
             border-bottom: 1px solid #e5e7eb;
         }
-        th {
-            background: #f9fafb;
-            font-weight: 600;
-            color: #111827;
-        }
+        th { background: #f9fafb; font-weight: 600; color: #111827; }
         .badge {
             background: #f3f4f6;
             padding: 4px 8px;
@@ -193,10 +145,7 @@ function renderIndexPage(env: Env, requestUrl: URL): string {
             font-family: monospace;
             font-size: 13px;
         }
-        .click-count {
-            font-weight: 600;
-            color: #3b82f6;
-        }
+        .click-count { font-weight: 600; color: #3b82f6; }
         .action-btn {
             background: none;
             border: none;
@@ -206,14 +155,8 @@ function renderIndexPage(env: Env, requestUrl: URL): string {
             padding: 4px 8px;
             width: auto;
         }
-        .action-btn:hover {
-            text-decoration: underline;
-        }
-        .loading {
-            text-align: center;
-            padding: 40px;
-            color: #9ca3af;
-        }
+        .action-btn:hover { text-decoration: underline; }
+        .loading { text-align: center; padding: 40px; color: #9ca3af; }
         @media (max-width: 768px) {
             .row { flex-direction: column; gap: 0; }
             .card-body { padding: 20px; }
@@ -388,7 +331,7 @@ function renderIndexPage(env: Env, requestUrl: URL): string {
 </html>`;
 }
 
-// ==================== 中间页 HTML（无 emoji，简洁风格） ====================
+// ==================== 中间页 HTML ====================
 function renderRedirectPage(slug: string, originalUrl: string, title?: string): string {
     const pageTitle = title ? `${title} - 链接跳转` : '短链接跳转';
     const displayUrl = originalUrl.length > 60 ? originalUrl.substring(0, 60) + '...' : originalUrl;
@@ -400,11 +343,7 @@ function renderRedirectPage(slug: string, originalUrl: string, title?: string): 
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>${escapeHtml(pageTitle)}</title>
     <style>
-        * {
-            margin: 0;
-            padding: 0;
-            box-sizing: border-box;
-        }
+        * { margin: 0; padding: 0; box-sizing: border-box; }
         body {
             font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', sans-serif;
             background: #f3f4f6;
@@ -423,12 +362,7 @@ function renderRedirectPage(slug: string, originalUrl: string, title?: string): 
             padding: 32px;
             text-align: center;
         }
-        h1 {
-            font-size: 24px;
-            font-weight: 600;
-            color: #111827;
-            margin-bottom: 8px;
-        }
+        h1 { font-size: 24px; font-weight: 600; color: #111827; margin-bottom: 8px; }
         .url-preview {
             background: #f9fafb;
             padding: 12px;
@@ -461,19 +395,9 @@ function renderRedirectPage(slug: string, originalUrl: string, title?: string): 
             width: 100%;
             transition: background 0.15s;
         }
-        .btn:hover {
-            background: #2563eb;
-        }
-        .footer {
-            margin-top: 24px;
-            font-size: 12px;
-            color: #9ca3af;
-        }
-        .countdown {
-            font-size: 13px;
-            color: #6b7280;
-            margin-top: 12px;
-        }
+        .btn:hover { background: #2563eb; }
+        .footer { margin-top: 24px; font-size: 12px; color: #9ca3af; }
+        .countdown { font-size: 13px; color: #6b7280; margin-top: 12px; }
     </style>
 </head>
 <body>
@@ -593,7 +517,12 @@ async function handleRecordClick(request: Request, env: Env, slug: string): Prom
 }
 
 async function handleRedirectPageRoute(request: Request, env: Env, slug: string): Promise<Response> {
-    let originalUrl = await env.KV.get(slug);
+    // 拒绝格式无效的 slug（防止扫描器攻击）
+    if (!/^[a-zA-Z0-9]+$/.test(slug)) {
+        return new Response('Invalid short link', { status: 404 });
+    }
+
+    let originalUrl = await env['KV-1'].get(slug);
     let linkInfo: { url: string; title: string | null } | null = null;
 
     if (originalUrl) {
