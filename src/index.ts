@@ -36,7 +36,6 @@ async function updateKVCache(env: Env, slug: string, url: string): Promise<void>
 }
 
 // ==================== 前端页面 HTML（简洁风格，无 emoji） ====================
-
 function renderIndexPage(env: Env, requestUrl: URL): string {
     return `<!DOCTYPE html>
 <html lang="zh-CN">
@@ -130,11 +129,8 @@ function renderIndexPage(env: Env, requestUrl: URL): string {
 </div>
 
 <script>
-    // 添加启动日志
-    console.log('短链页面脚本开始执行');
-
     (function() {
-        // 获取 DOM 元素
+        // DOM 元素
         const baseUrl = window.location.origin;
         const createBtn = document.getElementById('createBtn');
         const resultDiv = document.getElementById('result');
@@ -143,40 +139,31 @@ function renderIndexPage(env: Env, requestUrl: URL): string {
         const errorMsgDiv = document.getElementById('errorMsg');
         const linksListDiv = document.getElementById('linksList');
 
-        // 检查必需元素是否存在
-        if (!createBtn) console.error('未找到 createBtn 元素');
-        if (!resultDiv) console.error('未找到 resultDiv 元素');
-        if (!shortUrlInput) console.error('未找到 shortUrlInput 元素');
-        if (!copyBtn) console.error('未找到 copyBtn 元素');
-        if (!errorMsgDiv) console.error('未找到 errorMsgDiv 元素');
-        if (!linksListDiv) console.error('未找到 linksListDiv 元素');
-
-        // 工具函数：HTML 转义
-        function escapeHtml(str) {
+        // 公用转义函数
+        const escapeHtml = (str) => {
             if (!str) return '';
-            return str.replace(/[&<>]/g, function(m) {
+            return str.replace(/[&<>]/g, (m) => {
                 if (m === '&') return '&amp;';
                 if (m === '<') return '&lt;';
                 if (m === '>') return '&gt;';
                 return m;
             });
-        }
+        };
 
-        // 全局复制函数（用于表格中的按钮）
-        window.copyToClipboard = function(text) {
-            navigator.clipboard.writeText(text).then(() => {
-                alert('已复制: ' + text);
-            }).catch(err => {
-                console.error('复制失败:', err);
+        // 复制功能（全局供事件委托调用）
+        window.copyShortUrl = function(url) {
+            navigator.clipboard.writeText(url).then(() => {
+                alert('已复制: ' + url);
+            }).catch(() => {
                 alert('复制失败，请手动复制');
             });
         };
 
-        // 渲染链接列表
+        // 渲染链接表格（不使用 onclick 属性，改用 data 属性 + 事件委托）
         function renderLinksTable(links) {
             if (!linksListDiv) return;
             if (!links || links.length === 0) {
-                linksListDiv.innerHTML = '<div style="text-align:center;padding:20px;color:#9ca3af;">暂无链接，创建第一个吧</div>';
+                linksListDiv.innerHTML = '<div class="loading">暂无链接，创建第一个吧</div>';
                 return;
             }
             let html = '<table><thead><tr><th>短码</th><th>原始链接</th><th>标题</th><th>点击次数</th><th>创建时间</th><th>操作</th></tr></thead><tbody>';
@@ -184,7 +171,6 @@ function renderIndexPage(env: Env, requestUrl: URL): string {
                 const shortUrl = baseUrl + '/' + link.slug;
                 const displayUrl = link.url.length > 50 ? link.url.substring(0, 50) + '...' : link.url;
                 const date = new Date(link.created_at).toLocaleString();
-                // 对变量进行安全转义
                 const safeSlug = escapeHtml(link.slug);
                 const safeUrl = escapeHtml(link.url);
                 const safeDisplayUrl = escapeHtml(displayUrl);
@@ -195,7 +181,7 @@ function renderIndexPage(env: Env, requestUrl: URL): string {
                     '<td>' + safeTitle + '</td>' +
                     '<td class="click-count">' + link.clicks + '</td>' +
                     '<td>' + date + '</td>' +
-                    '<td><button class="action-btn" onclick="copyToClipboard(\'' + shortUrl.replace(/'/g, "\\'") + '\')">复制链接</button></td>' +
+                    '<td><button class="action-btn copy-link-btn" data-url="' + shortUrl.replace(/"/g, '&quot;') + '">复制链接</button></td>' +
                 '</tr>';
             }
             html += '</tbody></table>';
@@ -210,23 +196,30 @@ function renderIndexPage(env: Env, requestUrl: URL): string {
                 if (data.success && data.links && data.links.length > 0) {
                     renderLinksTable(data.links);
                 } else {
-                    if (linksListDiv) linksListDiv.innerHTML = '<div style="text-align:center;padding:20px;color:#9ca3af;">暂无链接，创建第一个吧</div>';
+                    if (linksListDiv) linksListDiv.innerHTML = '<div class="loading">暂无链接，创建第一个吧</div>';
                 }
             } catch (err) {
                 console.error('加载链接列表失败:', err);
-                if (linksListDiv) linksListDiv.innerHTML = '<div style="text-align:center;padding:20px;color:#dc2626;">加载失败，请刷新</div>';
+                if (linksListDiv) linksListDiv.innerHTML = '<div class="loading" style="color:#dc2626;">加载失败，请刷新</div>';
             }
         }
 
-        // 生成短链接
+        // 事件委托：处理表格中的复制按钮点击
+        if (linksListDiv) {
+            linksListDiv.addEventListener('click', (e) => {
+                const btn = e.target.closest('.copy-link-btn');
+                if (btn && btn.dataset.url) {
+                    copyShortUrl(btn.dataset.url);
+                }
+            });
+        }
+
+        // 创建短链接
         async function handleCreate() {
-            if (!createBtn) return;
             const urlInput = document.getElementById('originalUrl');
             const slugInput = document.getElementById('customSlug');
             const titleInput = document.getElementById('title');
-            if (!urlInput) return;
-
-            const url = urlInput.value.trim();
+            const url = urlInput ? urlInput.value.trim() : '';
             const slug = slugInput ? slugInput.value.trim() : '';
             const title = titleInput ? titleInput.value.trim() : '';
 
@@ -243,8 +236,10 @@ function renderIndexPage(env: Env, requestUrl: URL): string {
                 return;
             }
 
-            createBtn.disabled = true;
-            createBtn.innerText = '创建中...';
+            if (createBtn) {
+                createBtn.disabled = true;
+                createBtn.innerText = '创建中...';
+            }
             if (errorMsgDiv) errorMsgDiv.innerText = '';
 
             try {
@@ -261,27 +256,28 @@ function renderIndexPage(env: Env, requestUrl: URL): string {
                     if (urlInput) urlInput.value = '';
                     if (slugInput) slugInput.value = '';
                     if (titleInput) titleInput.value = '';
-                    loadLinks();  // 刷新列表
+                    loadLinks(); // 刷新列表
                 } else {
                     if (errorMsgDiv) errorMsgDiv.innerText = data.error || '创建失败';
                     if (resultDiv) resultDiv.classList.add('show');
                 }
             } catch (err) {
-                console.error('创建短链接请求失败:', err);
+                console.error('创建请求失败:', err);
                 if (errorMsgDiv) errorMsgDiv.innerText = '网络错误，请稍后重试';
                 if (resultDiv) resultDiv.classList.add('show');
             } finally {
-                createBtn.disabled = false;
-                createBtn.innerText = '生成短链接';
+                if (createBtn) {
+                    createBtn.disabled = false;
+                    createBtn.innerText = '生成短链接';
+                }
             }
         }
 
-        // 复制按钮事件
+        // 复制短链接（独立复制按钮）
         if (copyBtn && shortUrlInput) {
-            copyBtn.addEventListener('click', function() {
+            copyBtn.addEventListener('click', () => {
                 shortUrlInput.select();
-                navigator.clipboard.writeText(shortUrlInput.value);
-                alert('短链接已复制');
+                copyShortUrl(shortUrlInput.value);
             });
         }
 
@@ -289,19 +285,16 @@ function renderIndexPage(env: Env, requestUrl: URL): string {
         if (createBtn) {
             createBtn.addEventListener('click', handleCreate);
         } else {
-            console.error('无法绑定创建事件：createBtn 元素不存在');
+            console.error('未找到 createBtn');
         }
 
-        // 初始化加载链接列表
+        // 启动
         loadLinks();
-        console.log('短链页面脚本初始化完成');
     })();
 </script>
 </body>
 </html>`;
 }
-
-
 // ==================== 中间页 HTML ====================
 function renderRedirectPage(slug: string, originalUrl: string, title?: string): string {
     const pageTitle = title ? `${title} - 链接跳转` : '短链接跳转';
