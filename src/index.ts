@@ -2,6 +2,7 @@
 export interface Env {
     DB: D1Database;
     'KV-1': KVNamespace;   // 绑定名称必须与 Dashboard 中的变量名一致：KV-1
+    AI: any;               // Cloudflare Workers AI binding
 }
 
 interface LinkRecord {
@@ -10,6 +11,18 @@ interface LinkRecord {
     title: string | null;
     clicks: number;
     created_at: string;
+    domain?: string | null;
+    page_title?: string | null;
+    moderation_status?: string | null;
+    moderation_result?: string | null;
+    is_blocked?: number;
+}
+
+interface ModerationResult {
+    isSafe: boolean;
+    categories: string[];
+    confidence: number;
+    reason?: string;
 }
 
 // ==================== 工具函数 ====================
@@ -29,6 +42,153 @@ function escapeHtml(str: string): string {
         .replace(/>/g, '&gt;')
         .replace(/"/g, '&quot;')
         .replace(/'/g, '&#39;');
+}
+
+// 提取域名
+function extractDomain(url: string): string | null {
+    try {
+        const urlObj = new URL(url);
+        return urlObj.hostname;
+    } catch {
+        return null;
+    }
+}
+
+// 获取页面内容
+async function fetchPageContent(url: string): Promise<{ title: string | null; content: string | null }> {
+    try {
+        const controller = new AbortController();
+        const timeoutId = setTimeout(() => controller.abort(), 10000); // 10秒超时
+
+        const response = await fetch(url, {
+            signal: controller.signal,
+            headers: {
+                'User-Agent': 'Mozilla/5.0 (compatible; ShortURLBot/1.0)'
+            }
+        });
+
+        clearTimeout(timeoutId);
+
+        if (!response.ok) {
+            return { title: null, content: null };
+        }
+
+        const html = await response.text();
+
+        // 提取 title
+        const titleMatch = html.match(/<title[^>]*>([^<]*)<\/title>/i);
+        const title = titleMatch ? titleMatch[1].trim() : null;
+
+        // 提取文本内容（去除 HTML 标签）
+        const textContent = html
+            .replace(/<script[^>]*>[\s\S]*?<\/script>/gi, '')
+            .replace(/<style[^>]*>[\s\S]*?<\/style>/gi, '')
+            .replace(/<[^>]+>/g, ' ')
+            .replace(/\s+/g, ' ')
+            .trim();
+
+        // 只取前 5000 字符用于审核
+        const content = textContent.substring(0, 5000);
+
+        return { title, content: content || null };
+    } catch (error) {
+        console.error('获取页面内容失败:', error);
+        return { title: null, content: null };
+    }
+}
+
+// AI 内容审核
+async function moderateContent(ai: any, content: string): Promise<ModerationResult> {
+    try {
+        // 使用 Cloudflare Workers AI 的文本分类模型
+        const response = await ai.run('@cf/huggingface/distilbert-sst-2-int8', {
+            text: content.substring(0, 512) // 限制输入长度
+        });
+
+        // 分析结果
+        const isSafe = !response.some((item: any) => 
+            item.label === 'NEGATIVE' && item.score > 0.7
+        );
+
+        const categories: string[] = [];
+        if (!isSafe) {
+            categories.push('inappropriate_content');
+        }
+
+        return {
+            isSafe,
+            categories,
+            confidence: response[0]?.score || 0,
+            reason: isSafe ? '内容通过审核' : '检测到不当内容'
+        };
+    } catch (error) {
+        console.error('AI 审核失败:', error);
+        // 如果 AI 审核失败，返回保守结果
+        return {
+            isSafe: true,
+            categories: [],
+            confidence: 0,
+            reason: '审核服务暂时不可用，已跳过'
+        };
+    }
+}
+
+// 执行内容审核并更新数据库
+async function performContentModeration(env: Env, slug: string, url: string): Promise<void> {
+    try {
+        // 1. 提取域名
+        const domain = extractDomain(url);
+
+        // 2. 获取页面内容
+        const { title, content } = await fetchPageContent(url);
+
+        // 3. AI 审核
+        let moderationResult: ModerationResult;
+        if (content) {
+            moderationResult = await moderateContent(env.AI, content);
+        } else {
+            moderationResult = {
+                isSafe: true,
+                categories: [],
+                confidence: 0,
+                reason: '无法获取页面内容，跳过审核'
+            };
+        }
+
+        // 4. 更新数据库
+        await env.DB.prepare(`
+            UPDATE links 
+            SET domain = ?, 
+                page_title = ?, 
+                moderation_status = ?, 
+                moderation_result = ?, 
+                moderated_at = datetime("now"),
+                is_blocked = ?
+            WHERE slug = ?
+        `).bind(
+            domain,
+            title,
+            moderationResult.isSafe ? 'approved' : 'rejected',
+            JSON.stringify(moderationResult),
+            moderationResult.isSafe ? 0 : 1,
+            slug
+        ).run();
+
+        console.log(`内容审核完成 [${slug}]:`, moderationResult);
+    } catch (error) {
+        console.error('内容审核流程失败:', error);
+        // 即使审核失败，也标记为已审核（但不拦截）
+        await env.DB.prepare(`
+            UPDATE links 
+            SET moderation_status = 'error', 
+                moderation_result = ?, 
+                moderated_at = datetime("now")
+            WHERE slug = ?
+        `).bind(
+            JSON.stringify({ error: String(error) }),
+            slug
+        ).run();
+    }
 }
 
 async function updateKVCache(env: Env, slug: string, url: string): Promise<void> {
@@ -166,7 +326,7 @@ function renderIndexPage(env: Env, requestUrl: URL): string {
                 linksListDiv.innerHTML = '<div class="loading">暂无链接，创建第一个吧</div>';
                 return;
             }
-            let html = '<table><thead><tr><th>短码</th><th>原始链接</th><th>标题</th><th>点击次数</th><th>创建时间</th><th>操作</th></tr></thead><tbody>';
+            let html = '<table><thead><tr><th>短码</th><th>原始链接</th><th>标题</th><th>域名</th><th>审核状态</th><th>点击次数</th><th>创建时间</th><th>操作</th></tr></thead><tbody>';
             for (const link of links) {
                 const shortUrl = baseUrl + '/' + link.slug;
                 const displayUrl = link.url.length > 50 ? link.url.substring(0, 50) + '...' : link.url;
@@ -175,10 +335,28 @@ function renderIndexPage(env: Env, requestUrl: URL): string {
                 const safeUrl = escapeHtml(link.url);
                 const safeDisplayUrl = escapeHtml(displayUrl);
                 const safeTitle = link.title ? escapeHtml(link.title) : '-';
+                const safeDomain = link.domain ? escapeHtml(link.domain) : '-';
+                
+                // 审核状态徽章
+                let moderationBadge = '';
+                if (link.moderation_status === 'pending') {
+                    moderationBadge = '<span style="background:#fef3c7;color:#92400e;padding:4px 8px;border-radius:6px;font-size:12px;">审核中</span>';
+                } else if (link.moderation_status === 'approved') {
+                    moderationBadge = '<span style="background:#d1fae5;color:#065f46;padding:4px 8px;border-radius:6px;font-size:12px;">已通过</span>';
+                } else if (link.moderation_status === 'rejected') {
+                    moderationBadge = '<span style="background:#fee2e2;color:#991b1b;padding:4px 8px;border-radius:6px;font-size:12px;">已拒绝</span>';
+                } else if (link.moderation_status === 'error') {
+                    moderationBadge = '<span style="background:#f3f4f6;color:#6b7280;padding:4px 8px;border-radius:6px;font-size:12px;">审核失败</span>';
+                } else {
+                    moderationBadge = '<span style="color:#9ca3af;font-size:12px;">未审核</span>';
+                }
+                
                 html += '<tr>' +
                     '<td><span class="badge">' + safeSlug + '</span></td>' +
                     '<td title="' + safeUrl + '">' + safeDisplayUrl + '</td>' +
                     '<td>' + safeTitle + '</td>' +
+                    '<td>' + safeDomain + '</td>' +
+                    '<td>' + moderationBadge + '</td>' +
                     '<td class="click-count">' + link.clicks + '</td>' +
                     '<td>' + date + '</td>' +
                     '<td><button class="action-btn copy-link-btn" data-url="' + shortUrl.replace(/"/g, '&quot;') + '">复制链接</button></td>' +
@@ -358,44 +536,86 @@ function renderRedirectPage(slug: string, originalUrl: string, title?: string): 
             font-size: 14px;
             width: 100%;
             transition: background 0.15s;
+            margin-top: 12px;
         }
         .btn:hover { background: #2563eb; }
+        .btn-secondary {
+            background: #6b7280;
+        }
+        .btn-secondary:hover { background: #4b5563; }
         .footer { margin-top: 24px; font-size: 12px; color: #9ca3af; }
-        .countdown { font-size: 13px; color: #6b7280; margin-top: 12px; }
+        .info-text { font-size: 14px; color: #6b7280; margin-top: 12px; }
+        .title-display {
+            background: #ecfdf5;
+            border: 1px solid #10b981;
+            padding: 12px;
+            border-radius: 8px;
+            margin: 16px 0;
+            text-align: left;
+            font-size: 14px;
+            color: #065f46;
+        }
+        .title-loading { color: #9ca3af; font-style: italic; }
+        .title-error { color: #dc2626; font-size: 13px; margin-top: 8px; }
     </style>
 </head>
 <body>
 <div class="card">
-    <h1>正在跳转</h1>
+    <h1>链接跳转</h1>
     <p style="color: #6b7280; font-size: 14px;">您即将访问以下链接</p>
     <div class="url-preview">${escapeHtml(displayUrl)}</div>
     <div class="warning">请核对链接地址，谨防钓鱼网站。</div>
+    <div id="titleSection"></div>
+    <button class="btn btn-secondary" id="fetchTitleBtn">获取目标标题</button>
     <button class="btn" id="redirectBtn">确认跳转</button>
-    <div class="countdown" id="countdown">3 秒后自动跳转...</div>
+    <p class="info-text">点击按钮后将跳转到目标网站</p>
     <div class="footer">短链接服务 · 安全提醒</div>
 </div>
 <script>
-    let countdown = 3;
-    const countdownEl = document.getElementById('countdown');
     const btn = document.getElementById('redirectBtn');
+    const fetchTitleBtn = document.getElementById('fetchTitleBtn');
+    const titleSection = document.getElementById('titleSection');
     const targetUrl = ${JSON.stringify(originalUrl)};
     const slug = ${JSON.stringify(slug)};
 
-    function redirect() {
+    // 手动跳转
+    btn.addEventListener('click', () => {
         fetch('/api/click/' + slug, { method: 'POST', keepalive: true }).catch(() => {});
         window.location.href = targetUrl;
-    }
+    });
 
-    btn.addEventListener('click', redirect);
-    const timer = setInterval(() => {
-        countdown--;
-        if (countdown <= 0) {
-            clearInterval(timer);
-            redirect();
-        } else {
-            countdownEl.textContent = countdown + ' 秒后自动跳转...';
+    // 获取目标标题（用户主动触发）
+    fetchTitleBtn.addEventListener('click', async () => {
+        fetchTitleBtn.disabled = true;
+        fetchTitleBtn.textContent = '获取中...';
+        titleSection.innerHTML = '<p class="title-loading">正在获取标题...</p>';
+
+        try {
+            const resp = await fetch('/api/title/' + slug);
+            const data = await resp.json();
+
+            if (data.success && data.title) {
+                titleSection.innerHTML = '<div class="title-display"><strong>目标标题：</strong>' + escapeHtml(data.title) + '</div>';
+            } else if (data.success && !data.title) {
+                titleSection.innerHTML = '<p class="title-error">未能获取到页面标题</p>';
+            } else {
+                titleSection.innerHTML = '<p class="title-error">获取失败：' + escapeHtml(data.error || '未知错误') + '</p>';
+            }
+        } catch (err) {
+            titleSection.innerHTML = '<p class="title-error">网络错误，请稍后重试</p>';
+        } finally {
+            fetchTitleBtn.disabled = false;
+            fetchTitleBtn.textContent = '获取目标标题';
         }
-    }, 1000);
+    });
+
+    // HTML 转义函数
+    function escapeHtml(str) {
+        if (!str) return '';
+        const div = document.createElement('div');
+        div.textContent = str;
+        return div.innerHTML;
+    }
 </script>
 </body>
 </html>`;
@@ -435,10 +655,21 @@ async function handleCreateLink(request: Request, env: Env): Promise<Response> {
         }
 
         await env.DB.prepare(
-            'INSERT INTO links (slug, url, title, created_at) VALUES (?, ?, ?, datetime("now"))'
+            'INSERT INTO links (slug, url, title, created_at, moderation_status) VALUES (?, ?, ?, datetime("now"), "pending")'
         ).bind(slug, url, title || null).run();
 
         await updateKVCache(env, slug, url);
+
+        // 异步执行内容审核（不阻塞响应）
+        const ctx = (request as any).ctx;
+        if (ctx && ctx.waitUntil) {
+            ctx.waitUntil(performContentModeration(env, slug, url));
+        } else {
+            // 如果没有 waitUntil，仍然执行但不等待
+            performContentModeration(env, slug, url).catch(err => {
+                console.error('后台审核失败:', err);
+            });
+        }
 
         const requestUrl = new URL(request.url);
         const shortUrl = `${requestUrl.protocol}//${requestUrl.host}/${slug}`;
@@ -447,7 +678,8 @@ async function handleCreateLink(request: Request, env: Env): Promise<Response> {
             success: true,
             slug,
             short_url: shortUrl,
-            original_url: url
+            original_url: url,
+            moderation_status: 'pending'
         }, { status: 201 });
     } catch (error) {
         console.error('创建链接失败:', error);
@@ -458,7 +690,7 @@ async function handleCreateLink(request: Request, env: Env): Promise<Response> {
 async function handleListLinks(env: Env): Promise<Response> {
     try {
         const { results } = await env.DB.prepare(
-            'SELECT slug, url, title, clicks, created_at FROM links ORDER BY created_at DESC LIMIT 100'
+            'SELECT slug, url, title, clicks, created_at, domain, page_title, moderation_status, moderation_result, is_blocked FROM links ORDER BY created_at DESC LIMIT 100'
         ).all();
         return Response.json({ success: true, links: results });
     } catch (error) {
@@ -478,6 +710,107 @@ async function handleRecordClick(request: Request, env: Env, slug: string): Prom
         await updatePromise;
     }
     return Response.json({ success: true });
+}
+
+async function handleGetTitle(env: Env, slug: string): Promise<Response> {
+    try {
+        // 从数据库获取目标 URL
+        const result = await env.DB.prepare('SELECT url FROM links WHERE slug = ?').bind(slug).first<{ url: string }>();
+        if (!result) {
+            return Response.json({ error: '链接不存在' }, { status: 404 });
+        }
+
+        const targetUrl = result.url;
+
+        // 使用 fetch 获取目标页面标题（带超时和错误处理）
+        try {
+            const controller = new AbortController();
+            const timeoutId = setTimeout(() => controller.abort(), 5000); // 5秒超时
+
+            const response = await fetch(targetUrl, {
+                signal: controller.signal,
+                headers: {
+                    'User-Agent': 'Mozilla/5.0 (compatible; ShortURLBot/1.0)'
+                }
+            });
+
+            clearTimeout(timeoutId);
+
+            if (!response.ok) {
+                return Response.json({ success: true, title: null, message: '无法访问目标页面' });
+            }
+
+            const html = await response.text();
+
+            // 提取 title 标签内容
+            const titleMatch = html.match(/<title[^>]*>([^<]*)<\/title>/i);
+            const title = titleMatch ? titleMatch[1].trim() : null;
+
+            return Response.json({ success: true, title });
+        } catch (fetchError: any) {
+            console.error('获取标题失败:', fetchError);
+            return Response.json({
+                success: true,
+                title: null,
+                error: fetchError.name === 'AbortError' ? '请求超时' : '无法获取页面内容'
+            });
+        }
+    } catch (error) {
+        console.error('获取标题API错误:', error);
+        return Response.json({ error: '服务器内部错误' }, { status: 500 });
+    }
+}
+
+async function handleGetModerationStatus(env: Env, slug: string): Promise<Response> {
+    try {
+        const result = await env.DB.prepare(
+            'SELECT slug, url, domain, page_title, moderation_status, moderation_result, is_blocked, moderated_at FROM links WHERE slug = ?'
+        ).bind(slug).first();
+
+        if (!result) {
+            return Response.json({ error: '链接不存在' }, { status: 404 });
+        }
+
+        return Response.json({ success: true, data: result });
+    } catch (error) {
+        console.error('查询审核状态失败:', error);
+        return Response.json({ error: '查询失败' }, { status: 500 });
+    }
+}
+
+async function handleRetryModeration(request: Request, env: Env, slug: string): Promise<Response> {
+    try {
+        // 检查链接是否存在
+        const link = await env.DB.prepare('SELECT url FROM links WHERE slug = ?').bind(slug).first<{ url: string }>();
+        if (!link) {
+            return Response.json({ error: '链接不存在' }, { status: 404 });
+        }
+
+        // 重置审核状态
+        await env.DB.prepare(`
+            UPDATE links 
+            SET moderation_status = 'pending', 
+                moderation_result = NULL, 
+                is_blocked = 0, 
+                moderated_at = NULL 
+            WHERE slug = ?
+        `).bind(slug).run();
+
+        // 异步重新审核
+        const ctx = (request as any).ctx;
+        if (ctx && ctx.waitUntil) {
+            ctx.waitUntil(performContentModeration(env, slug, link.url));
+        } else {
+            performContentModeration(env, slug, link.url).catch(err => {
+                console.error('重新审核失败:', err);
+            });
+        }
+
+        return Response.json({ success: true, message: '已重新开始审核' });
+    } catch (error) {
+        console.error('重新审核失败:', error);
+        return Response.json({ error: '服务器内部错误' }, { status: 500 });
+    }
 }
 
 async function handleRedirectPageRoute(request: Request, env: Env, slug: string): Promise<Response> {
@@ -524,6 +857,21 @@ export default {
             const slug = path.substring('/api/click/'.length);
             if (!slug) return new Response('Missing slug', { status: 400 });
             return handleRecordClick(request, env, slug);
+        }
+        if (path.startsWith('/api/title/') && request.method === 'GET') {
+            const slug = path.substring('/api/title/'.length);
+            if (!slug) return new Response('Missing slug', { status: 400 });
+            return handleGetTitle(env, slug);
+        }
+        if (path.startsWith('/api/moderation/') && request.method === 'GET') {
+            const slug = path.substring('/api/moderation/'.length);
+            if (!slug) return new Response('Missing slug', { status: 400 });
+            return handleGetModerationStatus(env, slug);
+        }
+        if (path.startsWith('/api/moderation/') && request.method === 'POST') {
+            const slug = path.substring('/api/moderation/'.length);
+            if (!slug) return new Response('Missing slug', { status: 400 });
+            return handleRetryModeration(request, env, slug);
         }
         if (path === '/' && request.method === 'GET') {
             return new Response(renderIndexPage(env, url), {
