@@ -20,9 +20,11 @@ interface LinkRecord {
 
 interface ModerationResult {
     isSafe: boolean;
+    safetyLevel: 'safe' | 'caution' | 'unsafe'; // 安全等级：安全/需谨慎/不安全
     categories: string[];
     confidence: number;
     reason?: string;
+    details?: string; // 详细说明
 }
 
 // ==================== 工具函数 ====================
@@ -97,38 +99,85 @@ async function fetchPageContent(url: string): Promise<{ title: string | null; co
     }
 }
 
-// AI 内容审核
+// AI 内容审核 - 使用 LLM 进行智能分析
 async function moderateContent(ai: any, content: string): Promise<ModerationResult> {
     try {
-        // 使用 Cloudflare Workers AI 的文本分类模型
-        const response = await ai.run('@cf/huggingface/distilbert-sst-2-int8', {
-            text: content.substring(0, 512) // 限制输入长度
+        // 构建提示词,要求 LLM 返回结构化数据
+        const prompt = `请分析以下网页内容的安全性,并以 JSON 格式返回审核结果。
+
+审核标准:
+1. 安全等级(safetyLevel): "safe"(完全安全), "caution"(需谨慎,如包含广告、推广等), "unsafe"(不安全,如色情、暴力、诈骗等)
+2. 分类(categories): 从以下选择: ["clean", "advertisement", "promotion", "adult", "violence", "gambling", "scam", "malware", "hate_speech", "spam"]
+3. 是否安全(isSafe): safetyLevel 为 "safe" 或 "caution" 时为 true, "unsafe" 时为 false
+4. 置信度(confidence): 0-1 之间的数字
+5. 理由(reason): 简短说明审核结论
+6. 详情(details): 详细说明发现的问题(如果有)
+
+待审核内容(前500字符):
+${content.substring(0, 500)}
+
+请只返回 JSON 格式,不要其他文字。示例:
+{
+  "safetyLevel": "safe",
+  "isSafe": true,
+  "categories": ["clean"],
+  "confidence": 0.95,
+  "reason": "内容健康,无违规信息",
+  "details": "页面内容为正常的技术文章"
+}`;
+
+        // 调用 LLM (使用 Qwen 模型)
+        const response = await ai.run('@cf/qwen/qwen1.5-7b-chat-awq', {
+            messages: [
+                { role: 'system', content: '你是一个内容安全审核专家,负责评估网页内容的安全性。' },
+                { role: 'user', content: prompt }
+            ],
+            max_tokens: 300,
+            temperature: 0.1
         });
 
-        // 分析结果
-        const isSafe = !response.some((item: any) => 
-            item.label === 'NEGATIVE' && item.score > 0.7
-        );
-
-        const categories: string[] = [];
-        if (!isSafe) {
-            categories.push('inappropriate_content');
+        // 解析 LLM 返回的 JSON
+        let result: ModerationResult;
+        try {
+            // 提取 JSON (LLM 可能返回额外的文字)
+            const jsonMatch = response.response?.match(/\{[\s\S]*\}/);
+            if (jsonMatch) {
+                const parsed = JSON.parse(jsonMatch[0]);
+                result = {
+                    isSafe: parsed.isSafe ?? true,
+                    safetyLevel: parsed.safetyLevel || 'safe',
+                    categories: parsed.categories || ['clean'],
+                    confidence: parsed.confidence || 0.8,
+                    reason: parsed.reason || '审核完成',
+                    details: parsed.details || ''
+                };
+            } else {
+                throw new Error('无法解析 JSON');
+            }
+        } catch (parseError) {
+            console.warn('LLM 返回解析失败,使用默认结果:', parseError);
+            // 解析失败时,默认为需人工审核
+            result = {
+                isSafe: true,
+                safetyLevel: 'caution',
+                categories: ['unknown'],
+                confidence: 0.5,
+                reason: 'AI 审核结果解析失败,已标记为需人工审核',
+                details: '原始响应: ' + (response.response?.substring(0, 200) || 'empty')
+            };
         }
 
-        return {
-            isSafe,
-            categories,
-            confidence: response[0]?.score || 0,
-            reason: isSafe ? '内容通过审核' : '检测到不当内容'
-        };
+        return result;
     } catch (error) {
-        console.error('AI 审核失败:', error);
-        // 如果 AI 审核失败，返回保守结果
+        console.error('AI 审核服务调用失败:', error);
+        // 服务不可用时,不拦截但记录状态
         return {
             isSafe: true,
-            categories: [],
+            safetyLevel: 'caution',
+            categories: ['service_unavailable'],
             confidence: 0,
-            reason: '审核服务暂时不可用，已跳过'
+            reason: '审核服务暂时不可用',
+            details: '请稍后重新审核或联系管理员'
         };
     }
 }
@@ -337,16 +386,30 @@ function renderIndexPage(env: Env, requestUrl: URL): string {
                 const safeTitle = link.title ? escapeHtml(link.title) : '-';
                 const safeDomain = link.domain ? escapeHtml(link.domain) : '-';
                 
-                // 审核状态徽章
+                // 审核状态徽章 - 显示安全等级
                 let moderationBadge = '';
                 if (link.moderation_status === 'pending') {
-                    moderationBadge = '<span style="background:#fef3c7;color:#92400e;padding:4px 8px;border-radius:6px;font-size:12px;">审核中</span>';
-                } else if (link.moderation_status === 'approved') {
-                    moderationBadge = '<span style="background:#d1fae5;color:#065f46;padding:4px 8px;border-radius:6px;font-size:12px;">已通过</span>';
-                } else if (link.moderation_status === 'rejected') {
-                    moderationBadge = '<span style="background:#fee2e2;color:#991b1b;padding:4px 8px;border-radius:6px;font-size:12px;">已拒绝</span>';
+                    moderationBadge = '<span style="background:#fef3c7;color:#92400e;padding:4px 8px;border-radius:6px;font-size:12px;white-space:nowrap;">⏳ 审核中</span>';
+                } else if (link.moderation_result) {
+                    try {
+                        const result = JSON.parse(link.moderation_result);
+                        const level = result.safetyLevel || 'safe';
+                        const confidence = result.confidence ? Math.round(result.confidence * 100) : 0;
+                        
+                        if (level === 'safe') {
+                            moderationBadge = `<span style="background:#d1fae5;color:#065f46;padding:4px 8px;border-radius:6px;font-size:12px;white-space:nowrap;" title="${escapeHtml(result.reason || '')}">✓ 安全 ${confidence}%</span>`;
+                        } else if (level === 'caution') {
+                            moderationBadge = `<span style="background:#fef3c7;color:#92400e;padding:4px 8px;border-radius:6px;font-size:12px;white-space:nowrap;" title="${escapeHtml(result.reason || '')}">⚠ 需谨慎 ${confidence}%</span>`;
+                        } else if (level === 'unsafe') {
+                            moderationBadge = `<span style="background:#fee2e2;color:#991b1b;padding:4px 8px;border-radius:6px;font-size:12px;white-space:nowrap;" title="${escapeHtml(result.reason || '')}">✗ 不安全 ${confidence}%</span>`;
+                        } else {
+                            moderationBadge = '<span style="background:#f3f4f6;color:#6b7280;padding:4px 8px;border-radius:6px;font-size:12px;white-space:nowrap;">待审核</span>';
+                        }
+                    } catch (e) {
+                        moderationBadge = '<span style="color:#9ca3af;font-size:12px;">已审核</span>';
+                    }
                 } else if (link.moderation_status === 'error') {
-                    moderationBadge = '<span style="background:#f3f4f6;color:#6b7280;padding:4px 8px;border-radius:6px;font-size:12px;">审核失败</span>';
+                    moderationBadge = '<span style="background:#f3f4f6;color:#6b7280;padding:4px 8px;border-radius:6px;font-size:12px;white-space:nowrap;">审核失败</span>';
                 } else {
                     moderationBadge = '<span style="color:#9ca3af;font-size:12px;">未审核</span>';
                 }
